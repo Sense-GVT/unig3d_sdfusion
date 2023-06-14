@@ -4,7 +4,7 @@ import os
 from collections import OrderedDict
 from functools import partial
 from inspect import isfunction
-
+from pytorch3d.io import load_objs_as_meshes, save_obj
 import numpy as np
 import einops
 import mcubes
@@ -40,7 +40,7 @@ from models.networks.diffusion_networks.samplers.ddim import DDIMSampler
 from utils.distributed import reduce_loss_dict
 
 # rendering
-from utils.util_3d import init_mesh_renderer, render_sdf
+from utils.util_3d import init_mesh_renderer, render_sdf, sdf_to_mesh, save_mesh_as_gif
 
 class SDFusionImage2ShapeModel(BaseModel):
     def name(self):
@@ -106,6 +106,7 @@ class SDFusionImage2ShapeModel(BaseModel):
 
         if opt.ckpt is not None:
             self.load_ckpt(opt.ckpt, load_opt=self.isTrain)
+
             
         # transforms
         self.to_tensor = transforms.ToTensor()
@@ -345,7 +346,6 @@ class SDFusionImage2ShapeModel(BaseModel):
         self.switch_train()
 
         c_img = self.cond_model(self.img).float()
-        
         # 1. encode to latent
         #    encoder, quant_conv, but do not quantize
         #    check: ldm.models.autoencoder.py, VQModelInterface's encode(self, x)
@@ -394,11 +394,10 @@ class SDFusionImage2ShapeModel(BaseModel):
 
 
         self.gen_df = self.vqvae_module.decode_no_quant(samples)
-
         self.switch_train()
 
     @torch.no_grad()
-    def img2shape(self, image, mask, ddim_steps=None, ddim_eta=0., uc_scale=None,
+    def img2shape(self, image, mask=None, ddim_steps=None, ddim_eta=0., uc_scale=None,
                   infer_all=False, max_sample=16):
         #######################
         ### preprocess data ###
@@ -411,8 +410,11 @@ class SDFusionImage2ShapeModel(BaseModel):
             transforms.Normalize(mean, std),
             transforms.Resize((256, 256)),
         ])
-        
-        _, img = preprocess_image(image, mask)
+        if mask is None:
+            from PIL import Image
+            img = np.array(Image.open(image).convert('RGB'))
+        else:
+            _, img = preprocess_image(image, mask)
         img = transforms(img)
         self.img = img.unsqueeze(0).to(self.device)
         self.uc_img = torch.zeros_like(self.img).to(self.device)
@@ -441,10 +443,7 @@ class SDFusionImage2ShapeModel(BaseModel):
                                                         unconditional_conditioning=uc,
                                                         eta=ddim_eta,
                                                         quantize_x0=False)
-
-
         self.gen_df = self.vqvae_module.decode_no_quant(samples)
-
         return self.gen_df
 
 
@@ -552,8 +551,9 @@ class SDFusionImage2ShapeModel(BaseModel):
         self.df.load_state_dict(state_dict['df'])
         self.cond_model.load_state_dict(state_dict['cond_model'])
         print(colored('[*] weight successfully load from: %s' % ckpt, 'blue'))
-
         if load_opt:
-            self.optimizer.load_state_dict(state_dict['opt'])
-            print(colored('[*] optimizer successfully restored from: %s' % ckpt, 'blue'))
+            if 'opt' in state_dict:
+                self.optimizer.load_state_dict(state_dict['opt'])
+                print(colored('[*] optimizer successfully restored from: %s' % ckpt, 'blue'))
+
 

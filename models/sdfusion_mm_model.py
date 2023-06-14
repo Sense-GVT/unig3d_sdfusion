@@ -1,12 +1,12 @@
-# Reference: diffusion is borrowed from the LDM repo: https://github.com/CompVis/latent-diffusion
-# Specifically, functions from: https://github.com/CompVis/latent-diffusion/blob/main/ldm/models/diffusion/ddpm.py
 import os
 from collections import OrderedDict
 from functools import partial
+from inspect import isfunction
 
 import cv2
 import numpy as np
 import einops
+import mcubes
 from omegaconf import OmegaConf
 from termcolor import colored, cprint
 from einops import rearrange, repeat
@@ -22,7 +22,8 @@ import torchvision.transforms as transforms
 from models.base_model import BaseModel
 from models.networks.vqvae_networks.network import VQVAE
 from models.networks.diffusion_networks.network import DiffusionUNet
-from models.networks.resnet_v1 import resnet18
+# from models.networks.resnet_v1 import resnet18
+from models.networks.clip_networks.network import CLIPImageEncoder
 from models.networks.bert_networks.network import BERTTextEncoder
 from models.model_utils import load_vqvae
 
@@ -42,7 +43,7 @@ from utils.distributed import reduce_loss_dict
 # rendering
 from utils.util_3d import init_mesh_renderer, render_sdf
 
-class SDFusionMultiModal2ShapeModel(BaseModel):
+class SDFusionMM2ShapeModel(BaseModel):
     def name(self):
         return 'SDFusion-Multi-Modal-Conditional-Shape-Generation-Model'
 
@@ -81,13 +82,14 @@ class SDFusionMultiModal2ShapeModel(BaseModel):
         self.vqvae = load_vqvae(vq_conf, vq_ckpt=opt.vq_ckpt, opt=opt)
 
         # init cond model
-        self.img_enc = resnet18(pretrained=True) # context dim: 512
+        # self.img_enc = resnet18(pretrained=True) # context dim: 512
+        self.img_enc = CLIPImageEncoder()
         self.img_enc.to(self.device)
         for param in self.img_enc.parameters():
             param.requires_grad = True
             
         # map to text_dim
-        img_context_d = 512
+        img_context_d = 768
         txt_context_d = df_conf.bert.params.n_embed
         self.img_linear = nn.Linear(img_context_d, txt_context_d)
         self.img_linear.to(self.device)
@@ -120,7 +122,6 @@ class SDFusionMultiModal2ShapeModel(BaseModel):
 
         if opt.ckpt is not None:
             self.load_ckpt(opt.ckpt, load_opt=self.isTrain)
-            
         # transforms
         self.to_tensor = transforms.ToTensor()
 
@@ -350,6 +351,7 @@ class SDFusionMultiModal2ShapeModel(BaseModel):
         model_output = self.apply_model(x_noisy, t, cond)
 
         loss_dict = {}
+        # prefix = 'train' if self.training else 'val'
 
         if self.parameterization == "x0":
             target = x_start
@@ -359,7 +361,9 @@ class SDFusionMultiModal2ShapeModel(BaseModel):
             raise NotImplementedError()
 
         # l2
+        # loss_simple = self.get_loss(model_output, target, mean=False).mean([1, 2, 3])
         loss_simple = self.get_loss(model_output, target, mean=False).mean([1, 2, 3, 4])
+        # loss_dict.update({f'{prefix}/loss_simple': loss_simple.mean()})
         loss_dict.update({f'loss_simple': loss_simple.mean()})
 
         logvar_t = self.logvar[t].to(self.device)
@@ -399,8 +403,8 @@ class SDFusionMultiModal2ShapeModel(BaseModel):
         #    encoder, quant_conv, but do not quantize
         #    check: ldm.models.autoencoder.py, VQModelInterface's encode(self, x)
         with torch.no_grad():
+            # z = self.vqvae_module.encode_no_quant(self.x)
             z = self.vqvae(self.x, forward_no_quant=True, encode_only=True).detach()
-
         # 2. do diffusion's forward
         t = torch.randint(0, self.num_timesteps, (z.shape[0],), device=self.device).long()
         z_noisy, target, loss, loss_dict = self.p_losses(z, c_mm, t)
@@ -411,7 +415,7 @@ class SDFusionMultiModal2ShapeModel(BaseModel):
     # check: ddpm.py, log_images(). line 1317~1327
     @torch.no_grad()
     # def inference(self, data, sample=True, ddim_steps=None, ddim_eta=0., quantize_denoised=True, infer_all=False):
-    def inference(self, data, ddim_steps=None, ddim_eta=0., uc_scale=None,
+    def naive_inference(self, data, ddim_steps=None, ddim_eta=0., uc_scale=None,
                   infer_all=False, max_sample=16):
 
         self.switch_eval()
@@ -441,9 +445,10 @@ class SDFusionMultiModal2ShapeModel(BaseModel):
 
         c_img = self.img_linear(c_img)
         c_mm = torch.cat([c_img, c_txt], dim=1)
-        shape = self.z_shape
 
         # get noise, denoise, and decode with vqvae
+        B = c_img.shape[0]
+        shape = self.z_shape
         samples, intermediates = self.ddim_sampler.sample(S=ddim_steps,
                                                         batch_size=B,
                                                         shape=shape,
@@ -456,13 +461,74 @@ class SDFusionMultiModal2ShapeModel(BaseModel):
 
         self.gen_df = self.vqvae_module.decode_no_quant(samples)
         self.switch_train()
+        return self.gen_df
 
-    # def mm_inference(self, data, ddim_steps=None, ddim_eta=0., uc_scale=3.,
-    #         txt_scale=1.0, img_scale=1.0, mask_mode='1', mask_x=False,
-    #         mm_cls_free=False,
-    #     ):
-    def mm_inference(self, data, mask_mode=None, ddim_steps=None, ddim_eta=0., uc_scale=None, 
-                  txt_scale=1.0, img_scale=1.0, mm_cls_free=False, infer_all=False, max_sample=16):
+    @torch.no_grad()
+    def mm2shape(self, image, text, mask=None, ddim_steps=None, ddim_eta=0., uc_scale=None,
+                  infer_all=False, max_sample=16):
+        #######################
+        ### preprocess data ###
+        from utils.demo_util import preprocess_image
+        import torchvision.transforms as transforms
+
+        mean, std = [0.5, 0.5, 0.5], [0.5, 0.5, 0.5]
+        transforms = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(mean, std),
+            transforms.Resize((256, 256)),
+        ])
+        if mask is None:
+            from PIL import Image
+            img = np.array(Image.open(image).convert('RGB'))
+        else:
+            _, img = preprocess_image(image, mask)
+        img = transforms(img)
+        self.img = img.unsqueeze(0).to(self.device)
+        self.uc_img = torch.zeros_like(self.img).to(self.device)
+        self.txt = [text]
+        self.uc_txt = [""]
+        #######################
+
+        # real inference
+        self.switch_eval()
+
+        if ddim_steps is None:
+            ddim_steps = self.ddim_steps
+
+        if uc_scale is None:
+            uc_scale = self.uc_scale
+
+        img_uc_feat = self.img_enc(self.uc_img)
+        txt_uc_feat = self.txt_enc(self.uc_txt)
+
+        img_uc_feat = self.img_linear(img_uc_feat)
+        mm_uc_feat = torch.cat([img_uc_feat, txt_uc_feat], dim=1)
+
+        c_img = self.img_enc(self.img)
+        c_txt = self.txt_enc(self.txt)
+
+        c_img = self.img_linear(c_img)
+        c_mm = torch.cat([c_img, c_txt], dim=1)
+        shape = self.z_shape
+
+        # get noise, denoise, and decode with vqvae
+        B = c_img.shape[0]
+        shape = self.z_shape
+        samples, intermediates = self.ddim_sampler.sample(S=ddim_steps,
+                                                          batch_size=B,
+                                                          shape=shape,
+                                                          conditioning=c_mm,
+                                                          verbose=False,
+                                                          unconditional_guidance_scale=uc_scale,
+                                                          unconditional_conditioning=mm_uc_feat,
+                                                          eta=ddim_eta,
+                                                          quantize_x0=False)
+
+        self.gen_df = self.vqvae_module.decode_no_quant(samples)
+
+        return self.gen_df
+    def inference(self, data, mask_mode=None, ddim_steps=None, ddim_eta=0., uc_scale=None, 
+                  txt_scale=1.0, img_scale=1.0, mm_cls_free=False, infer_all=False, max_sample=1):
     
         self.switch_eval()
 
@@ -483,13 +549,12 @@ class SDFusionMultiModal2ShapeModel(BaseModel):
         B = self.x.shape[0]
         z = self.vqvae(self.x, forward_no_quant=True, encode_only=True)
 
-        # get mask
-        from utils.demo_util import get_shape_mask
-        x_mask, z_mask = get_shape_mask(mask_mode)
+        # TODO: get mask given mask_mode
+        # x_mask, z_mask = get_mask(mask_mode)
 
         # for vis purpose
-        self.x_part = self.x.clone()
-        self.x_part[~x_mask] = 0.2
+        # self.x_part = self.x.clone()
+        # self.x_part[~x_mask] = 0.2
 
         shape = self.z_shape
 
@@ -520,7 +585,6 @@ class SDFusionMultiModal2ShapeModel(BaseModel):
                                                             conditioning=c_mm,
                                                             verbose=False,
                                                             x0=z,
-                                                            mask=z_mask,
                                                             unconditional_guidance_scale=uc_scale,
                                                             unconditional_conditioning=mm_uc_feat,
                                                             eta=ddim_eta,)
@@ -658,7 +722,8 @@ class SDFusionMultiModal2ShapeModel(BaseModel):
             'img_linear': self.img_linear_module.state_dict(),
             'txt_enc': self.txt_enc_module.state_dict(),
             'df': self.df_module.state_dict(),
-            # 'opt': self.optimizer.state_dict(),
+            'global_step': global_step,
+            'opt': self.optimizer.state_dict(),
         }
         
         if save_opt:
@@ -685,7 +750,6 @@ class SDFusionMultiModal2ShapeModel(BaseModel):
         self.img_linear.load_state_dict(state_dict['img_linear'])
         self.txt_enc.load_state_dict(state_dict['txt_enc'])
         print(colored('[*] weight successfully load from: %s' % ckpt, 'blue'))
-
         if load_opt:
             self.optimizer.load_state_dict(state_dict['opt'])
             print(colored('[*] optimizer successfully restored from: %s' % ckpt, 'blue'))
